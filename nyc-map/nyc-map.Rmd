@@ -1,0 +1,128 @@
+---
+title: "Rental listing New York city map"
+author: "Wei Xu"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+---
+
+```{r setup, include=TRUE, echo=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, message = FALSE, fig.align = "center", warning = FALSE)
+```
+
+## Load necessary packages
+
+```{r package}
+library(jsonlite)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(ggmap)
+library(knitr)
+```
+
+## Load training data
+
+```{r train}
+KAGGLE <- TRUE
+train_path <- ifelse(KAGGLE, "../input/train.json", "data/train.json")
+training <- fromJSON(train_path) %>% bind_rows 
+# Keep list variables 
+features <- training$features
+photos <- training$photos
+# Remove list variables from data
+training$features <- NULL
+training$photos <- NULL 
+# Convert to data.frame
+training <- sapply(training, unlist) %>%
+  data.frame(., stringsAsFactors = FALSE)
+# Add removed variables
+training$features <- features
+training$photos <- photos
+# Clean memory
+rm(features)
+rm(photos)
+```
+
+## Numerical and factor variables
+
+```{r num-vs-factor}
+numerical_variables <- c("bathrooms", "bedrooms", "longitude", "latitude", "price")
+training[, numerical_variables] %<>% lapply(., as.numeric)
+training$interest_level <- as.factor(training$interest_level)
+```
+
+## Extra feature: distance to city center
+
+```{r center}
+# New York City Center Coords
+ny_lat <- 40.785091; ny_lon <- -73.968285
+# Alternate New York City Center Coords
+ny_center <- geocode("new york", source = "google")
+ny_center
+# Add Euclidean Distance to City Center
+training$distance_city <- mapply(
+      function(lon, lat) sqrt((lon - ny_lon)^2  + (lat - ny_lat)^2), 
+      training$longitude, training$latitude) 
+```
+
+## Density plot of distance
+
+```{r distance-dp, fig.align="center"}
+# Discard real state far from City Center
+ny_outliners_dist <- 0.2
+ggplot(training[training$distance_city < ny_outliners_dist, ], 
+       aes(distance_city, color = interest_level)) + geom_density()
+```
+
+```{r dist-logdp, fig.align="center"}
+# Discard real state far from City Center
+ggplot(training, aes(log(distance_city), color = interest_level)) + 
+      geom_density()
+```
+
+## NYC satellite map
+
+```{r map, fig.align="center"}
+map <- get_googlemap(zoom = 12,
+  # Use Alternate New York City Center Coords
+  center = ny_center %>% as.numeric,
+  maptype = "satellite", sensor = FALSE)
+
+p <- ggmap(map) + 
+      geom_point(size = 1, data = training, 
+                 aes(x = longitude, y = latitude, color = interest_level)) + 
+      facet_grid(facets = . ~ interest_level, scales = "free", space = "free") +
+      xlab("") + ylab("") + scale_colour_brewer(palette = "Set1")
+p
+```
+
+## Outliers: find real coordinates
+
+```{r outlier}
+outliers_addrs <- training[training$longitude == 0 | 
+                                 training$latitude == 0, ]$street_address
+outliers_addrs
+# addresses are supposed to be in nyc
+outliers_ny <- paste(outliers_addrs, ", new york")
+# search for geological location from google
+outliers_addrs <- data.frame("street_address" = outliers_addrs)
+coords <- sapply(outliers_ny,
+                 function(x) geocode(x, source = "google")) %>%
+  t %>%
+  data.frame %>%
+  cbind(outliers_addrs, .)
+rownames(coords) <- 1:nrow(coords)
+# Display table
+kable(coords)
+```
+
+## Update dataset
+
+```{r update}
+training[training$longitude == 0,]$longitude <- coords$lon
+training[training$latitude == 0,]$latitude <- coords$lat
+```
+
+

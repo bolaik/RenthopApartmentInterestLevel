@@ -1,0 +1,108 @@
+---
+title: "New features from the Address field"
+author: "Wei Xu"
+date: "April 12, 2017"
+output:
+  pdf_document:
+    toc: false
+fontfamily: mathpazo
+urlcolor: magenta
+linkcolor: magenta
+citecolor: magenta
+---
+
+```{r loaddata}
+suppressMessages(library("jsonlite"))
+suppressMessages(library("dplyr"))
+suppressMessages(library("tidyr"))
+suppressMessages(library("plotly"))
+suppressMessages(library("purrr"))
+suppressMessages(library("RecordLinkage"))
+
+lst.trainData <- fromJSON("../input/train.json")
+vec.variables <- setdiff(names(lst.trainData), c("photos", "features"))
+df.train <-map_at(lst.trainData, vec.variables, unlist) %>% tibble::as_tibble(.)
+```
+
+In this notebook, I'll try to create a new feature based on the similarity between the street address and the display address. In order to do that, I used a function that is based on the Levenshtein Distance. In this particular case I used a package called "RecordLinkage" that did the work for me.
+
+```{r addr-similarity}
+vec.addressSimilarity <- levenshteinSim(
+      tolower(df.train$street_address),tolower(df.train$display_address))
+```
+
+Here you can see some examples of how the data looks like with the distance function,
+
+```{r dist}
+df.similaritySamples <- data.frame(
+      street_address = tolower(df.train$street_address),
+      display_address = tolower(df.train$display_address),
+      distance = vec.addressSimilarity)
+head(df.similaritySamples,10)
+```
+
+\newpage
+
+Finally, I decided to create a dummy variable based on this new feature and analyze the differences in the interest ratio for each group:
+- Group 1: Distance >= 0.5
+- Group 2: Distance < 0.5
+
+```{r grouping}
+vec.similarityHigherThanPointFive <- ifelse(vec.addressSimilarity >=0.5,1,0)
+df.train <- data.frame(df.train, vec.similarityHigherThanPointFive)
+df.groupOne <- subset(df.train, vec.similarityHigherThanPointFive == 1)
+df.groupTwo <- subset(df.train, vec.similarityHigherThanPointFive == 0)
+```
+
+pie chart view of the distribution of interest levels
+
+```{r freq-tb}
+df <- select(df.train, c(vec.similarityHigherThanPointFive, interest_level)) %>% drop_na()
+df_tb <- as.data.frame(table(df))
+vec_tb <- as.data.frame(table(df[,1]))
+colnames(vec_tb) <- c("vec.similarityHigherThanPointFive", "Freq")
+df_tb <- merge(df_tb, vec_tb, by = "vec.similarityHigherThanPointFive")
+df_tb
+```
+
+```{r pie-ggplot, fig.align="center"}
+df_tb <- mutate(df_tb, Freq = Freq.x/Freq.y) %>% select(c(1,2,5))
+bp = ggplot(df_tb, aes(x = factor(1), y = Freq, fill = interest_level))
+bp = bp + geom_bar(width = 1, stat = "identity" )
+bp = bp + facet_grid(facets = . ~ vec.similarityHigherThanPointFive)
+bp = bp + coord_polar(theta = "y") 
+bp + ylab("vec.similarityHigherThanPointFive") + 
+      xlab("Frequency") + 
+      labs(fill="interest_level")
+```
+
+\newpage
+
+Chi Square Independence Test
+
+```{r chi-sq}
+df.chiSquareTest <- data.frame(interest_level = df.train$interest_level,
+            group = vec.similarityHigherThanPointFive)
+chisq.test(df.chiSquareTest$group, df.chiSquareTest$interest_level)
+```
+
+Address Similarity Distribution
+
+```{r plot distribution, fig.align="center", fig.width=4.5}
+df.hist <- data.frame(interest_level = df.train$interest_level, 
+                      address_similarity = vec.addressSimilarity)
+df.hist[is.na(df.hist$address_similarity),c("address_similarity")] <- 
+      mean(df.hist$address_similarity,na.rm = T)
+hist <- hist(df.hist$address_similarity, 
+             col = "blue",
+             xlab = "Address Similarity", 
+             main = "Address Similarity Distribution")
+num.multiplier <- hist$counts / hist$density
+df.density <- density(df.hist$address_similarity)
+df.density$y <- df.density$y * num.multiplier[1]
+lines(df.density, col = "red")
+```
+
+In my opinion, there seems to be a relation that indicates that the larger the difference is, the more interested it gets. However, most of the values have shown to have a high similarity between both fields.
+
+UPDATE: After I ran a Chi Square an Independence Test we could clearly see that the address similarity is related to the interest level. (thanks to @saikiranputta suggestion)

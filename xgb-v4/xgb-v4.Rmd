@@ -1,0 +1,419 @@
+---
+title: "Two sigma rental listing inquries xgboost"
+author: "Wei Xu"
+date: "March 9, 2017"
+output:
+  pdf_document:
+    toc: false
+fontfamily: mathpazo
+urlcolor: magenta
+linkcolor: magenta
+citecolor: magenta
+---
+
+```{r setup, include=TRUE, echo=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, message = FALSE, warning = FALSE)
+library(xgboost)
+library(caret)
+library(stringr)
+library(quanteda)
+library(lubridate)
+library(stringr)
+library(Hmisc)
+library(Matrix)
+library(ggplot2)
+library(magrittr)
+library(ggmap)
+```
+
+- __Description feature: how to explore? Generate one, two, three grams exclusively, also not appear in features.__
+- __These two features: display_address and street_address have replicated informations. More detailed in street_address.__
+- __Is it fine to use concatenate features and photos in both t1 and s1?__
+
+## Load the training dataset
+
+```{r loadtrain}
+# load necessary packages
+packages <- c("jsonlite", "dplyr", "data.table", "purrr")
+purrr::walk(packages, library, character.only = TRUE, warn.conflicts = FALSE)
+# load train
+t1 <- fromJSON("../input/train.json")
+# extract posted features and perform nlp e.g. tolower and stemword
+t1_feats <- data.table(listing_id=rep(unlist(t1$listing_id), lapply(t1$features, length)), 
+                       features=unlist(t1$features))
+t1_feats <- t1_feats[, features:=gsub("[0-9]|[[:punct:]]", " ", trimws(tolower(features)))]
+t1_feats <- t1_feats[, features:=sapply(strsplit(features, "[[:space:]]+"), 
+                                        function(x) {
+                                              x <- char_wordstem(x); ib <- x == ""
+                                              # use collapse instead of sep in paste
+                                              paste(c("feature",x[!ib]), collapse = "_")}
+                                        )]
+# extract individual photo urls
+t1_photos <- data.table(listing_id=rep(unlist(t1$listing_id), lapply(t1$photos, length)), 
+                        features=unlist(t1$photos))
+# unlist all vars except photo and features and convert data table
+vars <- setdiff(names(t1), c("photos", "features")) # set operation: difference
+t1 <- map_at(t1, vars, unlist) %>% as.data.table(.)
+t1 <- t1[ , filter:=0]
+data.frame(sapply(t1, class))
+##> head(t1_feats, 10)
+data.frame(t1 = dim(t1), t1_feats = dim(t1_feats), t1_photos = dim(t1_photos), 
+           row.names = c("row", "col"))
+```
+
+## Create 5-fold CV
+
+```{r cv-fold}
+# create 5 fold CV
+set.seed(321)
+cvFoldsList <- createFolds(t1$interest_level, k=5, list=TRUE, returnTrain=FALSE)
+```
+
+```{r interest-level}
+# Convert classes to integers for xgboost
+class <- data.table(interest_level=c("low", "medium", "high"), class=c(0,1,2))
+t1 <- merge(t1, class, by="interest_level", all.x=TRUE, sort=F)
+```
+
+## Load the test dataset
+
+```{r loadtest}
+s1 <- fromJSON("../input/test.json")
+s1_feats <- data.table(listing_id=rep(unlist(s1$listing_id), lapply(s1$features, length)), 
+                       features=unlist(s1$features))
+s1_feats <- s1_feats[, features:=gsub("[0-9]|[[:punct:]]", " ", trimws(tolower(features)))]
+s1_feats <- s1_feats[, features:=sapply(strsplit(features, "[[:space:]]+"), 
+                                        function(x) {
+                                              x <- char_wordstem(x); ib <- x == ""
+                                              paste(c("feature", x[!ib]), collapse = "_")}
+                                        )]
+s1_photos <- data.table(listing_id=rep(unlist(s1$listing_id), lapply(s1$photos, length)), 
+                        features=unlist(s1$photos))
+vars <- setdiff(names(s1), c("photos", "features"))
+s1 <- map_at(s1, vars, unlist) %>% as.data.table(.)
+s1 <- s1[,":="(interest_level="pending", class=-1, filter=2)]
+data.frame(s1 = dim(s1), s1_feats = dim(s1_feats), s1_photos = dim(s1_photos), 
+           row.names = c("row", "col"))
+```
+
+## Combine train and test data
+
+```{r combine}
+ts1 <- rbind(t1, s1)
+rm(t1, s1)
+ts1_feats <- rbind(t1_feats, s1_feats)
+rm(t1_feats, s1_feats)
+ts1_photos <- rbind(t1_photos, s1_photos)
+rm(t1_photos, s1_photos)
+data.frame(ts1 = dim(ts1), ts1_feats = dim(ts1_feats), ts1_photos = dim(ts1_photos), 
+           row.names = c("row", "col"))
+```
+
+## Load the time_stamp feature and merge with the train and test dataset
+
+```{r time_stamp}
+time_stamp <- fread("../input/listing_image_time.csv")
+ts1 <- merge(ts1, time_stamp, by.x = "listing_id", by.y = "Listing_Id", all.x = TRUE)
+```
+
+## Outliers of geographical data
+
+This piece of code is used to justify the outliers in the geographical data, i.e. `longitude` and `latitude`. A new feature `distance_city`, which quantifies the distance to the city center is also generated.
+
+```{r map}
+outliers_addrs <- ts1[longitude == 0 | latitude == 0, ]
+# addresses are supposed to be in nyc
+outliers_ny <- paste(outliers_addrs$street_address, ", new york")
+# search for geological location from google
+coords <- sapply(outliers_ny, function(x) geocode(x, source = "google")) %>% 
+      t %>% data.frame 
+# assign data from google
+ts1[longitude == 0 | latitude == 0, ]$longitude <- coords$lon
+ts1[longitude == 0 | latitude == 0, ]$latitude  <- coords$lat
+# add distance to city center feature
+ny_center <- geocode("new york", source = "google")
+ny_lat <- ny_center[1,2]; ny_lon <- ny_center[1,1]
+# Add Euclidean Distance to City Center
+ts1$distance_city <- mapply(
+      function(lon, lat) sqrt((lon - ny_lon)^2  + (lat - ny_lat)^2), 
+      ts1$longitude, ts1$latitude) 
+```
+
+## Some feature engineering
+
+```{r fe1}
+ts1 <- ts1[, ":="(created=as.POSIXct(created), 
+                  dummy="A",
+                  low=as.integer(interest_level=="low"),
+                  medium=as.integer(interest_level=="medium"),
+                  high=as.integer(interest_level=="high"),
+                  display_address=trimws(tolower(display_address)),
+                  street_address=trimws(tolower(street_address)))]
+ts1 <- ts1[, ":="(created_month=month(created),
+                  created_day=day(created),
+                  weekofday=as.integer(as.factor(weekdays(created))),
+                  created_hour=hour(created))]
+ts1 <- ts1[, ":="(pred0_low=sum(interest_level=="low")/sum(filter==0),
+                  pred0_medium=sum(interest_level=="medium")/sum(filter==0),
+                  pred0_high=sum(interest_level=="high")/sum(filter==0))]
+data.frame(sapply(ts1, function(x) class(x)[1]))
+```
+
+## Merge feature column
+
+```{r feature}
+# merge Feature column
+feats_summ <- ts1_feats[ , .N , by=features]
+# tabulate the data by rows (listing_id) and columns (features)
+ts1_feats_cast <- dcast.data.table(ts1_feats[!features %in% feats_summ[N<500, features]], 
+                                   listing_id ~ features, value.var = "features", 
+                                   fun.aggregate = function(x) as.integer(length(x) > 0))
+ts1 <- merge(ts1, ts1_feats_cast, by="listing_id", all.x=TRUE, sort=FALSE)
+rm(ts1_feats, feats_summ, ts1_feats_cast)
+```
+
+## Merge photo counts
+
+```{r photo}
+ts1_photos_summ <- ts1_photos[ , .(photo_count=.N), by=listing_id]
+ts1 <- merge(ts1, ts1_photos_summ, by="listing_id", all.x=TRUE, sort=FALSE)
+rm(ts1_photos, ts1_photos_summ)
+```
+
+## Engineer description feature
+
+```{r corpus}
+# load mycorpus
+library(tm)
+mycorpus <- VCorpus(VectorSource(ts1$description))
+# clean mycorpus
+toString <- content_transformer(function(x, from, to) gsub(from, to, x)) 
+mycorpus <- tm_map(mycorpus, content_transformer(tolower))
+mycorpus <- tm_map(mycorpus, toString, "[!.]([^!.]*)kagglemanager@renthop.com([^!.]*)", "")
+mycorpus <- tm_map(mycorpus, toString, "[!.]([^!.]*)website(.*)redacted([^!.]*)", "")
+mycorpus <- tm_map(mycorpus, toString, "<.*>", " ")
+mycorpus <- tm_map(mycorpus, toString, "[[:punct:]]", " ")
+mycorpus <- tm_map(mycorpus, removePunctuation)
+mycorpus <- tm_map(mycorpus, removeNumbers)
+mycorpus <- tm_map(mycorpus, removeWords, stopwords("english"))
+mycorpus <- tm_map(mycorpus, stemDocument)
+mycorpus <- tm_map(mycorpus, stripWhitespace)
+mycorpus <- tm_map(mycorpus, toString, 
+                   "( ([a-z]){1,3})+ |^([a-z]){1,3} | ([a-z]){1,3}$", " ")
+mycorpus <- tm_map(mycorpus, stripWhitespace)
+# bigramtokenizer from rweka
+library(RWeka)
+BigramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 2, max = 2))
+# document-term matrix
+bgram_dtm <- DocumentTermMatrix(mycorpus, control = list(tokenize = BigramTokenizer))
+# remove sparse terms
+bgram_dtm_sub <- removeSparseTerms(bgram_dtm, 0.97)
+ts1_desc <- data.table(as.matrix(bgram_dtm_sub))
+colnames(ts1_desc) <- gsub(" ", "_", paste0("descrpt_", names(ts1_desc)))
+ts1 <- cbind(ts1, ts1_desc)
+rm(mycorpus, bgram_dtm, bgram_dtm_sub)
+```
+
+## Sentiment analysis from description feature
+
+```{r sentiment}
+library(syuzhet)
+sentiment <- get_nrc_sentiment(ts1$description)
+ts1 <- cbind(ts1, sentiment)
+```
+
+## Grouping entry-one observation
+
+```{r rare-case}
+build_count <- ts1[,.(.N), by=building_id]
+manag_count <- ts1[,.(.N), by=manager_id]
+addre_count <- ts1[,.(.N), by=display_address]
+set(ts1, i=which(ts1[["building_id"]] %in% build_count[N==1, building_id]), 
+    j="building_id", value="other")
+set(ts1, i=which(ts1[["manager_id"]] %in% manag_count[N==1, manager_id]), 
+    j="manager_id", value="other")
+set(ts1, i=which(ts1[["display_address"]] %in% addre_count[N==1, display_address]), 
+    j="display_address", value="other")
+```
+
+## Mean target encoding high cardinality variables
+
+```{r te-fn}
+# custom function for categorical encoding using target statistics
+catNWayAvgCV <- function(data, varList, y, pred0, filter, k, f, g=1, lambda=NULL, r_k, cv=NULL){
+      # It is probably best to sort your dataset first by filter and then by ID (or index)
+      n <- length(varList)
+      varNames <- paste0("v",seq(n))
+      ind <- unlist(cv, use.names=FALSE)
+      oof <- NULL
+      if (length(cv) > 0){
+            for (i in 1:length(cv)){
+                  sub1 <- data.table(v1=data[,varList,with=FALSE], y=data[,y,with=FALSE], 
+                                     pred0=data[,pred0,with=FALSE], filt=filter)
+                  sub1 <- sub1[sub1$filt==TRUE,]
+                  sub1[,filt:=NULL]
+                  colnames(sub1) <- c(varNames,"y","pred0")
+                  sub2 <- sub1[cv[[i]],]
+                  sub1 <- sub1[-cv[[i]],]
+                  sum1 <- sub1[,list(sumy=sum(y), avgY=mean(y), cnt=length(y)), by=varNames]
+                  tmp1 <- merge(sub2, sum1, by = varNames, all.x=TRUE, sort=FALSE)
+                  set(tmp1, i=which(is.na(tmp1[,cnt])), j="cnt", value=0)
+                  set(tmp1, i=which(is.na(tmp1[,sumy])), j="sumy", value=0)
+                  if(!is.null(lambda)) tmp1[beta:=lambda] 
+                  else tmp1[,beta:= 1/(g+exp((tmp1[,cnt] - k)/f))]
+                  tmp1[,adj_avg:=((1-beta)*avgY+beta*pred0)]
+                  set(tmp1, i=which(is.na(tmp1[["avgY"]])), j="avgY", 
+                      value=tmp1[is.na(tmp1[["avgY"]]), pred0])
+                  set(tmp1, i=which(is.na(tmp1[["adj_avg"]])), j="adj_avg", 
+                      value=tmp1[is.na(tmp1[["adj_avg"]]), pred0])
+                  set(tmp1, i=NULL, j="adj_avg", value=tmp1$adj_avg*(1+(runif(nrow(sub2))-0.5)*r_k))
+                  oof <- c(oof, tmp1$adj_avg)
+            }
+      }
+      oofInd <- data.frame(ind, oof)
+      oofInd <- oofInd[order(oofInd$ind),]
+      sub1 <- data.table(v1=data[,varList,with=FALSE], y=data[,y,with=FALSE],
+                         pred0=data[,pred0,with=FALSE], filt=filter)
+      colnames(sub1) <- c(varNames,"y","pred0","filt")
+      sub2 <- sub1[sub1$filt==F,]
+      sub1 <- sub1[sub1$filt==T,]
+      sum1 <- sub1[,list(sumy=sum(y), avgY=mean(y), cnt=length(y)), by=varNames]
+      tmp1 <- merge(sub2, sum1, by = varNames, all.x=TRUE, sort=FALSE)
+      tmp1$cnt[is.na(tmp1$cnt)] <- 0
+      tmp1$sumy[is.na(tmp1$sumy)] <- 0
+      if(!is.null(lambda)) tmp1$beta <- lambda else tmp1$beta <- 1/(g+exp((tmp1$cnt - k)/f))
+      tmp1$adj_avg <- (1-tmp1$beta)*tmp1$avgY + tmp1$beta*tmp1$pred0
+      tmp1$avgY[is.na(tmp1$avgY)] <- tmp1$pred0[is.na(tmp1$avgY)]
+      tmp1$adj_avg[is.na(tmp1$adj_avg)] <- tmp1$pred0[is.na(tmp1$adj_avg)]
+      # Combine train and test into one vector
+      return(c(oofInd$oof, tmp1$adj_avg))
+}
+```
+
+```{r te}
+highCard <- c("building_id", "manager_id")
+for (col in 1:length(highCard)){
+#      ts1[,paste0(highCard[col],"_mean_low"):=
+#                catNWayAvgCV(ts1, varList=c("dummy",highCard[col]), y="low", 
+#                             pred0="pred0_low", 
+#                             filter=ts1[["filter"]]==0, k=10, f=2, r_k=0.02, cv=cvFoldsList)]
+      ts1[,paste0(highCard[col],"_mean_med"):=
+                catNWayAvgCV(ts1, varList=c("dummy",highCard[col]), y="medium", 
+                             pred0="pred0_medium", 
+                             filter=ts1$filter==0, k=5, f=1, r_k=0.01, cv=cvFoldsList)]
+      ts1[,paste0(highCard[col],"_mean_high"):=
+                catNWayAvgCV(ts1, varList=c("dummy",highCard[col]), y="high", 
+                             pred0="pred0_high", 
+                             filter=ts1$filter==0, k=5, f=1, r_k=0.01, cv=cvFoldsList)]
+      }
+```
+
+## More feature engineering
+
+```{r fe2}
+# Create some date and other features
+ts1 <- ts1[,":="(
+      building_id=as.integer(as.factor(building_id)),
+      display_address=as.integer(as.factor(display_address)),
+      manager_id=as.integer(as.factor(manager_id)),
+      street_address=as.integer(as.factor(street_address)),
+      desc_wordcount=str_count(description),
+      pricePerBed=ifelse(!is.finite(price/bedrooms),-1, price/bedrooms),
+      pricePerBath=ifelse(!is.finite(price/bathrooms),-1, price/bathrooms),
+      pricePerRoom=ifelse(!is.finite(price/(bedrooms+bathrooms)),-1, price/(bedrooms+bathrooms)),
+      bedPerBath=ifelse(!is.finite(bedrooms/bathrooms), -1, price/bathrooms),
+      bedBathDiff=bedrooms-bathrooms,
+      bedBathSum=bedrooms+bathrooms,
+      bedsPerc=ifelse(!is.finite(bedrooms/(bedrooms+bathrooms)), -1, bedrooms/(bedrooms+bathrooms))
+    )]
+```
+
+## Missing values
+
+In the engineered data table `ts1`, the missing values appear in `feature` and `photo_count` related predictors, we should fill these missing values with zero.
+
+```{r na}
+for (col in 1:ncol(ts1)) set(ts1, i=which(is.na(ts1[[col]])), j=col, value=0)
+```
+
+## Selet predictors for training and create XGBoost training and test dataset
+
+```{r xgb-features}
+# get variable names
+varnames <- setdiff(colnames(ts1), 
+                    c("photos", "pred0_high", "pred0_low", "pred0_medium", 
+                      "description", "features", "interest_level", "dummy", "filter",
+                      "created", "class", "low", "medium", "high", "street_address"))
+# convert dataset to sparse format
+t1_sparse <- Matrix(as.matrix(ts1[filter==0, varnames, with=FALSE]), sparse=TRUE)
+s1_sparse <- Matrix(as.matrix(ts1[filter==2, varnames, with=FALSE]), sparse=TRUE)
+listing_id_test <- ts1[filter %in% c(2), listing_id]
+labels <- ts1[filter %in% c(0), class]
+# convert dataset to xgb format
+dtrain <- xgb.DMatrix(data=t1_sparse, label=labels)
+dtest <- xgb.DMatrix(data=s1_sparse)
+```
+
+## Training and testing with XGBoost
+
+```{r xgb-param}
+# select parameters
+param <- list(booster="gbtree",
+              objective="multi:softprob",
+              eval_metric="mlogloss",
+#              nthread=13,
+              num_class=3,
+              eta = .02,
+              gamma = 1,
+              max_depth = 4,
+              min_child_weight = 1,
+              subsample = .7, 
+              colsample_bytree = .5,
+              seed = 36683)
+```
+
+```{r cv, results="hide"}
+xgb2cv <- xgb.cv(data = dtrain,
+                 params = param,
+                 nrounds = 50000,
+                 maximize=FALSE,
+                 prediction = TRUE,
+                 folds = cvFoldsList,
+#                 nfold = 5,
+                 print_every_n = 50,
+                 early_stopping_round=300)
+```
+
+```{r train, results="hide"}
+# xgb train
+watch <- list(dtrain=dtrain)
+xgb2 <- xgb.train(data = dtrain,
+                  params = param,
+                  watchlist=watch,
+                  print_every_n = 50,
+                  nrounds = xgb2cv$best_ntreelimit
+#                  nrounds = 4452
+)
+```
+
+```{r pred}
+# xbg predict
+sPreds <- as.data.table(t(matrix(predict(xgb2, dtest), nrow=3, ncol=nrow(dtest))))
+colnames(sPreds) <- class$interest_level
+fwrite(data.table(listing_id=listing_id_test, sPreds[,list(high,medium,low)]), 
+       "submission.csv")
+```
+
+## View important features
+
+```{r importance-plot, fig.align="center", fig.width=5}
+importance_matrix <- xgb.importance(model = xgb2)
+##> xgb.plot.importance(importance_matrix = importance_matrix)
+##> print(importance_matrix)
+importance_matrix <- 
+      importance_matrix[, ":="(Varnames=varnames[as.numeric(importance_matrix$Feature)+1])]
+print(importance_matrix[,c("Feature", "Varnames", "Gain")], 
+      nrows = dim(importance_matrix)[1])
+```
+
+

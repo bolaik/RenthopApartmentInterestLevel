@@ -1,0 +1,137 @@
+---
+title: "Text mining: rental listing inquries description feature"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::html_docco:
+    highlight: kate
+---
+
+
+```{r knitr_init, echo=FALSE, cache=FALSE, message=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=FALSE,
+               cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, message = FALSE, warning = FALSE)
+library(xgboost)
+library(caret)
+library(stringr)
+library(quanteda)
+library(lubridate)
+library(stringr)
+library(Hmisc)
+library(Matrix)
+library(ggplot2)
+library(magrittr)
+library(ggmap)
+```
+
+## Load training dataset
+
+```{r loadtrain}
+# load necessary packages
+packages <- c("jsonlite", "dplyr", "data.table", "purrr")
+purrr::walk(packages, library, character.only = TRUE, warn.conflicts = FALSE)
+# load train
+t1 <- fromJSON("../input/train.json")
+vars <- setdiff(names(t1), c("photos", "features")) # set operation: difference
+t1 <- map_at(t1, vars, unlist) %>% as.data.table(.)
+```
+
+## Load description data as corpus
+
+```{r description}
+# load description data as corpus using quanteda package
+library(tm)
+description <- t1$description
+mycorpus <- VCorpus(VectorSource(description))
+rm(description)
+# corpus cleaning
+toString <- content_transformer(function(x, from, to) gsub(from, to, x)) 
+mycorpus <- tm_map(mycorpus, content_transformer(tolower))
+mycorpus <- tm_map(mycorpus, toString, "[!.]([^!.]*)kagglemanager@renthop.com([^!.]*)", "")
+mycorpus <- tm_map(mycorpus, toString, "[!.]([^!.]*)website(.*)redacted([^!.]*)", "")
+mycorpus <- tm_map(mycorpus, toString, "<.*>", " ")
+mycorpus <- tm_map(mycorpus, toString, "[[:punct:]]", " ")
+mycorpus <- tm_map(mycorpus, removePunctuation)
+mycorpus <- tm_map(mycorpus, removeNumbers)
+mycorpus <- tm_map(mycorpus, removeWords, stopwords("english"))
+mycorpus <- tm_map(mycorpus, stemDocument)
+mycorpus <- tm_map(mycorpus, stripWhitespace)
+mycorpus <- tm_map(mycorpus, toString, 
+                   "( ([a-z]){1,3})+ |^([a-z]){1,3} | ([a-z]){1,3}$", " ")
+mycorpus <- tm_map(mycorpus, stripWhitespace)
+# transfer cleaned corpus to vector
+t1_dscpt <- data.table(listing_id = t1$listing_id, text = get("content", mycorpus))
+```
+
+## Generate N-gram model
+
+```{r ngram-custom, message=FALSE, echo=FALSE}
+library(tau) 
+# custom function to create N-Grams from vector texts
+ngram <- function(docs, n) {textcnt(docs, method = "string",n=as.integer(n), 
+                                    split = "[ ]+",decreasing=T)}
+```
+
+```{r unigram}
+ugram_tau <- ngram(t1_dscpt$text, 1)
+ugram_wf <- data.table(unigram = names(ugram_tau), counts = unclass(ugram_tau))
+rm(ugram_tau)
+```
+
+```{r bigram}
+bgram_tau <- ngram(t1_dscpt$text, 2)
+bgram_wf <- data.table(bigram = names(bgram_tau), counts = unclass(bgram_tau))
+rm(bgram_tau)
+```
+
+```{r trigram}
+tgram_tau <- ngram(t1_dscpt$text, 3)
+tgram_wf <- data.table(trigram = names(tgram_tau), counts = unclass(tgram_tau))
+rm(tgram_tau)
+```
+
+```{r quadgram}
+qgram_tau <- ngram(t1_dscpt$text, 4)
+qgram_wf <- data.table(quadgram = names(qgram_tau), counts = unclass(qgram_tau))
+rm(qgram_tau)
+```
+
+## N-gram document-term matrix
+
+```{r bigramtokenizer}
+# define bigramtokenizer
+# method 1 rweka
+##> library(RWeka)
+##> BigramTokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 2, max = 2))
+# method 2 NLP package
+BigramTokenizer <- function(x)
+      unlist(lapply(ngrams(words(x), 2), paste, collapse = " "), use.names = FALSE)
+```
+
+
+```{r bigram-dtm}
+# document-term matrix
+bgram_dtm <- DocumentTermMatrix(mycorpus, control = list(tokenize = BigramTokenizer))
+# larger numbers include more terms
+inspect(removeSparseTerms(bgram_dtm, 0.96))
+```
+
+```{r trigram-dtm}
+TrigramTokenizer <- function(x)
+      unlist(lapply(ngrams(words(x), 3), paste, collapse = " "), use.names = FALSE)
+tgram_dtm <- DocumentTermMatrix(mycorpus, control = list(tokenize = TrigramTokenizer))
+# larger numbers include more terms
+inspect(removeSparseTerms(tgram_dtm, 0.8))
+```

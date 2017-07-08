@@ -1,0 +1,31 @@
+---
+title: "Sentiment analysis of description"
+author: "Wei Xu"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+---
+
+```{r setup, include=TRUE, echo=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, message = FALSE, warning = FALSE)
+packages <- c("jsonlite", "dplyr", "purrr")
+purrr::walk(packages, library, character.only = TRUE, warn.conflicts = FALSE)
+```
+
+In this notebook i will apply sentiment analysis classification to the description column. Finally I will check if there is some statistical difference if we use this new created variables. We call the required libraries and the train data set:
+
+```{r data}
+data <- fromJSON("../input/train.json")
+vars <- setdiff(names(data), c("photos", "features"))
+train_df <- map_at(data, vars, unlist) %>% tibble::as_tibble(.)
+```
+
+Secondly we apply sentiment analysis to the description column and we get a new data frame:   
+
+```{r sentiment, message=FALSE}
+library(syuzhet)
+library(DT)
+sentiment <- get_nrc_sentiment(train_df$description)
+datatable(head(sentiment))
+```
