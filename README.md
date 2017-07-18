@@ -26,6 +26,7 @@ The basic features include features from [Branden Murray's post](https://www.kag
 
 ## many helpful links for reference
 
+- [Check out top-1 solution and github repo for many insightful ideas about feature engineering](https://github.com/plantsgo/Rental-Listing-Inquiries)
 - [List of solution posts](https://www.kaggle.com/c/two-sigma-connect-rental-listing-inquiries/discussion/32119)
 - [My best solution only using manager_id](https://www.kaggle.com/c/two-sigma-connect-rental-listing-inquiries/discussion/32114)
 - [Unsupervised and supervised neighborhood encoding](https://www.kaggle.com/arnaldcat/unsupervised-and-supervised-neighborhood-encoding)
