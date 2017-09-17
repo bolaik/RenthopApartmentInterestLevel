@@ -13,7 +13,7 @@ ts1["jwd_type_low_than_num"] = list(map(lambda lo, la, ba, be, p:
 
 # same-type (bath, bed) apartment number in the same neighbourhood
 print('find total num of apartments of the same type in the neighborhood')
-ts1["jwd_type_all"] = list(map(lambda lo, la, ba, be:
+ts1["jwd_type_ts1"] = list(map(lambda lo, la, ba, be:
                                ts1[(ts1.latitude > la - 0.01) & (ts1.latitude < la + 0.01) & (ts1.longitude > lo - 0.01) & (ts1.longitude < lo + 0.01) &
                                    (ts1.bathrooms == ba) & (ts1.bedrooms == be)].shape[0],
                                ts1["longitude"], ts1["latitude"], ts1["bathrooms"], ts1["bedrooms"]))
